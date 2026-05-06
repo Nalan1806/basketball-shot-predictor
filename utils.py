@@ -1,302 +1,357 @@
 """
-Utility functions for the Basketball Shot Prediction System.
+Drawing Utilities — ShotIQ
 
-Contains shared helpers for drawing overlays, FPS calculation,
-coordinate math, and visual formatting.
+Draws exactly 8 visual elements on the frame. Nothing else.
+
+Elements:
+  1. draw_ball_dot         — small green circle at detected ball
+  2. draw_trajectory_trail — red arc of past positions
+  3. draw_predicted_arc    — blue arc of EKF future positions
+  4. draw_uncertainty_ellipses — red EKF confidence ellipses (axes clamped to 80px)
+  5. draw_telemetry_panel  — bottom-left dark panel: pos, vel, speed
+  6. draw_prediction_panel — top-right: SCORE/MISS + confidence bar
+  7. draw_hoop_region      — green rectangle when calibrated
+  8. draw_fps              — top-left FPS counter
+
+Also includes:
+  - FPSCounter utility class
+  - smooth_positions utility
+  - distance utility
 """
 
-import time
 import cv2
 import numpy as np
-import config
 
 
 # ─────────────────────────────────────────────
-# FPS Counter
+# Utility
 # ─────────────────────────────────────────────
 class FPSCounter:
-    """Smooth FPS counter using a rolling window average."""
+    """Exponential moving average FPS counter."""
 
-    def __init__(self, window_size=30):
-        self.window_size = window_size
-        self.timestamps = []
-        self.fps = 0.0
+    def __init__(self, alpha=0.1):
+        import time
+        self._alpha = alpha
+        self._fps   = 0.0
+        self._last  = time.time()
 
     def tick(self):
-        """Call once per frame to update the FPS calculation."""
+        import time
         now = time.time()
-        self.timestamps.append(now)
-        # Keep only the most recent timestamps
-        if len(self.timestamps) > self.window_size:
-            self.timestamps = self.timestamps[-self.window_size:]
-        if len(self.timestamps) >= 2:
-            elapsed = self.timestamps[-1] - self.timestamps[0]
-            self.fps = (len(self.timestamps) - 1) / elapsed if elapsed > 0 else 0.0
+        dt  = now - self._last
+        self._last = now
+        if dt > 0:
+            instant = 1.0 / dt
+            self._fps = self._alpha * instant + (1 - self._alpha) * self._fps
 
     def get_fps(self):
-        return self.fps
+        return self._fps
 
 
-# ─────────────────────────────────────────────
-# Drawing Utilities
-# ─────────────────────────────────────────────
-def draw_rounded_rect(frame, pt1, pt2, color, thickness, radius=10):
-    """Draw a rectangle with rounded corners."""
-    x1, y1 = pt1
-    x2, y2 = pt2
-
-    # Draw the four straight edges (inset by radius)
-    cv2.line(frame, (x1 + radius, y1), (x2 - radius, y1), color, thickness)
-    cv2.line(frame, (x1 + radius, y2), (x2 - radius, y2), color, thickness)
-    cv2.line(frame, (x1, y1 + radius), (x1, y2 - radius), color, thickness)
-    cv2.line(frame, (x2, y1 + radius), (x2, y2 - radius), color, thickness)
-
-    # Draw the four corner arcs
-    cv2.ellipse(frame, (x1 + radius, y1 + radius), (radius, radius), 180, 0, 90, color, thickness)
-    cv2.ellipse(frame, (x2 - radius, y1 + radius), (radius, radius), 270, 0, 90, color, thickness)
-    cv2.ellipse(frame, (x1 + radius, y2 - radius), (radius, radius), 90, 0, 90, color, thickness)
-    cv2.ellipse(frame, (x2 - radius, y2 - radius), (radius, radius), 0, 0, 90, color, thickness)
-
-
-def draw_ball_bbox(frame, x, y, w, h):
-    """Draw stylized bounding box around the detected ball."""
-    color = config.COLOR_BALL_BBOX
-    thickness = config.BBOX_THICKNESS
-    corner_len = min(w, h) // 3
-
-    # Draw corner brackets instead of a full rectangle for a modern look
-    # Top-left
-    cv2.line(frame, (x, y), (x + corner_len, y), color, thickness + 1)
-    cv2.line(frame, (x, y), (x, y + corner_len), color, thickness + 1)
-    # Top-right
-    cv2.line(frame, (x + w, y), (x + w - corner_len, y), color, thickness + 1)
-    cv2.line(frame, (x + w, y), (x + w, y + corner_len), color, thickness + 1)
-    # Bottom-left
-    cv2.line(frame, (x, y + h), (x + corner_len, y + h), color, thickness + 1)
-    cv2.line(frame, (x, y + h), (x, y + h - corner_len), color, thickness + 1)
-    # Bottom-right
-    cv2.line(frame, (x + w, y + h), (x + w - corner_len, y + h), color, thickness + 1)
-    cv2.line(frame, (x + w, y + h), (x + w, y + h - corner_len), color, thickness + 1)
-
-    # Draw a subtle center crosshair
-    cx, cy = x + w // 2, y + h // 2
-    cross_size = 6
-    cv2.line(frame, (cx - cross_size, cy), (cx + cross_size, cy), color, 1)
-    cv2.line(frame, (cx, cy - cross_size), (cx, cy + cross_size), color, 1)
-
-
-def draw_trajectory_trail(frame, points):
-    """Draw the tracked trajectory points with a fading trail effect."""
-    n = len(points)
-    if n < 2:
-        return
-
-    for i in range(1, n):
-        # Fade from transparent to solid — recent points are brighter
-        alpha = i / n
-        color = tuple(int(c * alpha) for c in config.COLOR_TRAJECTORY)
-        radius = max(2, int(config.TRAJECTORY_DOT_RADIUS * alpha))
-
-        cv2.circle(frame, points[i], radius, color, -1)
-
-        # Draw connecting lines between consecutive points
-        if i > 0:
-            line_color = tuple(int(c * alpha * 0.6) for c in config.COLOR_TRAJECTORY)
-            cv2.line(frame, points[i - 1], points[i], line_color, 1, cv2.LINE_AA)
-
-
-def draw_predicted_trajectory(frame, points):
-    """Draw the predicted future trajectory as a dashed curve."""
-    n = len(points)
-    if n < 2:
-        return
-
-    for i in range(1, n):
-        # Fade out as we go further into the future
-        alpha = max(0.2, 1.0 - (i / n) * 0.8)
-        color = tuple(int(c * alpha) for c in config.COLOR_PREDICTION)
-        radius = config.PREDICTION_DOT_RADIUS
-
-        # Dashed effect: draw every other segment
-        if i % 2 == 0:
-            cv2.circle(frame, points[i], radius, color, -1, cv2.LINE_AA)
-        cv2.line(frame, points[i - 1], points[i], color, 1, cv2.LINE_AA)
-
-
-def draw_hoop_region(frame, hoop_rect, is_score=False):
-    """Draw the hoop target region with visual feedback."""
-    x, y, w, h = hoop_rect
-
-    # Glow effect when scoring
-    if is_score:
-        # Draw multiple expanding rectangles for glow
-        for i in range(3, 0, -1):
-            glow_alpha = 0.3 * i
-            glow_color = tuple(int(c * glow_alpha) for c in config.COLOR_SCORE)
-            cv2.rectangle(frame, (x - i * 3, y - i * 3),
-                         (x + w + i * 3, y + h + i * 3), glow_color, 1)
-
-    # Main hoop rectangle
-    color = config.COLOR_SCORE if is_score else config.COLOR_HOOP
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, config.HOOP_THICKNESS)
-
-    # Hoop label
-    label = "HOOP"
-    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-    label_x = x + (w - label_size[0]) // 2
-    label_y = y - 8
-    cv2.putText(frame, label, (label_x, label_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-
-    # Draw small hoop net lines for visual flair
-    net_spacing = w // 6
-    for i in range(1, 6):
-        nx = x + i * net_spacing
-        cv2.line(frame, (nx, y + h), (nx + (i - 3) * 2, y + h + 15),
-                color, 1, cv2.LINE_AA)
-
-
-def draw_prediction_label(frame, prediction, confidence, frame_width):
-    """Draw the main SCORE/MISS prediction with confidence bar."""
-    if prediction is None:
-        return
-
-    is_score = prediction == "SCORE"
-    label = prediction
-    color = config.COLOR_SCORE if is_score else config.COLOR_MISS
-
-    # --- Background panel ---
-    panel_w = 340
-    panel_h = 110
-    panel_x = frame_width - panel_w - 20
-    panel_y = 20
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (panel_x, panel_y),
-                  (panel_x + panel_w, panel_y + panel_h),
-                  config.COLOR_PANEL_BG, -1)
-    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
-
-    # Panel border
-    cv2.rectangle(frame, (panel_x, panel_y),
-                  (panel_x + panel_w, panel_y + panel_h), color, 2)
-
-    # Accent line on the left edge
-    cv2.line(frame, (panel_x, panel_y), (panel_x, panel_y + panel_h), color, 4)
-
-    # --- Prediction text ---
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    text_size = cv2.getTextSize(label, font, config.FONT_SCALE_LARGE, 3)[0]
-    text_x = panel_x + 20
-    text_y = panel_y + 50
-
-    # Text shadow
-    cv2.putText(frame, label, (text_x + 2, text_y + 2),
-                font, config.FONT_SCALE_LARGE, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(frame, label, (text_x, text_y),
-                font, config.FONT_SCALE_LARGE, color, 3, cv2.LINE_AA)
-
-    # --- Confidence bar ---
-    bar_x = panel_x + 20
-    bar_y = panel_y + 70
-    bar_w = panel_w - 40
-    bar_h = 12
-
-    # Background
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h),
-                  (60, 60, 60), -1)
-
-    # Fill
-    fill_w = int(bar_w * confidence)
-    bar_color = config.COLOR_CONFIDENCE_HIGH if confidence > 0.6 else config.COLOR_CONFIDENCE_LOW
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h),
-                  bar_color, -1)
-
-    # Confidence text
-    conf_text = f"Confidence: {confidence:.0%}"
-    cv2.putText(frame, conf_text, (bar_x, bar_y + bar_h + 18),
-                font, config.FONT_SCALE_SMALL, config.COLOR_INFO, 1, cv2.LINE_AA)
-
-
-def draw_fps(frame, fps):
-    """Draw FPS counter in the top-left corner."""
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    # Background pill
-    text = f"FPS: {fps:.0f}"
-    text_size = cv2.getTextSize(text, font, config.FONT_SCALE_MEDIUM, 2)[0]
-    pad = 10
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10),
-                  (10 + text_size[0] + 2 * pad, 10 + text_size[1] + 2 * pad),
-                  config.COLOR_PANEL_BG, -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-
-    cv2.putText(frame, text, (10 + pad, 10 + text_size[1] + pad),
-                font, config.FONT_SCALE_MEDIUM, config.COLOR_FPS, 2, cv2.LINE_AA)
-
-
-def draw_status_bar(frame, status_text, frame_height, frame_width):
-    """Draw a bottom status bar with system info."""
-    bar_h = 35
-    bar_y = frame_height - bar_h
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, bar_y), (frame_width, frame_height),
-                  config.COLOR_PANEL_BG, -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-
-    # Status text
-    cv2.putText(frame, status_text, (15, bar_y + 23),
-                cv2.FONT_HERSHEY_SIMPLEX, config.FONT_SCALE_SMALL,
-                config.COLOR_INFO, 1, cv2.LINE_AA)
-
-    # Brand text on the right
-    brand = "ShotIQ v1.0"
-    brand_size = cv2.getTextSize(brand, cv2.FONT_HERSHEY_SIMPLEX,
-                                  config.FONT_SCALE_SMALL, 1)[0]
-    cv2.putText(frame, brand, (frame_width - brand_size[0] - 15, bar_y + 23),
-                cv2.FONT_HERSHEY_SIMPLEX, config.FONT_SCALE_SMALL,
-                (100, 200, 255), 1, cv2.LINE_AA)
-
-
-def draw_no_ball_indicator(frame, frames_missing):
-    """Draw a subtle indicator when the ball is not detected."""
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    text = f"Searching for ball... ({frames_missing} frames)"
-    text_size = cv2.getTextSize(text, font, config.FONT_SCALE_SMALL, 1)[0]
-
-    x = (frame.shape[1] - text_size[0]) // 2
-    y = 60
-
-    # Pulsing dot animation based on frame count
-    dot_color = (0, 150, 255) if (frames_missing // 4) % 2 == 0 else (0, 80, 150)
-    cv2.circle(frame, (x - 15, y - 5), 5, dot_color, -1)
-
-    cv2.putText(frame, text, (x, y), font, config.FONT_SCALE_SMALL,
-                (150, 150, 150), 1, cv2.LINE_AA)
-
-
-def smooth_positions(positions, window_size=None):
-    """Apply moving average smoothing to a list of (x, y) positions."""
-    if window_size is None:
-        window_size = config.SMOOTHING_WINDOW
-
-    if len(positions) < window_size:
+def smooth_positions(positions, window=5):
+    """Simple moving-average smoother over a list of (x, y) tuples."""
+    if len(positions) < 2:
         return positions
 
     smoothed = []
     for i in range(len(positions)):
-        start = max(0, i - window_size + 1)
-        window = positions[start:i + 1]
-        avg_x = int(np.mean([p[0] for p in window]))
-        avg_y = int(np.mean([p[1] for p in window]))
+        lo = max(0, i - window // 2)
+        hi = min(len(positions), i + window // 2 + 1)
+        chunk = positions[lo:hi]
+        avg_x = int(sum(p[0] for p in chunk) / len(chunk))
+        avg_y = int(sum(p[1] for p in chunk) / len(chunk))
         smoothed.append((avg_x, avg_y))
-
     return smoothed
 
 
 def distance(p1, p2):
-    """Euclidean distance between two 2D points."""
-    return np.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+    """Euclidean distance between two 2-D points."""
+    return float(np.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2))
+
+
+# ─────────────────────────────────────────────
+# 1. Ball dot
+# ─────────────────────────────────────────────
+def draw_ball_dot(frame, cx, cy, radius=10, held=True):
+    """
+    Draw the detected ball:
+    - When held (held=True): thin circle OUTLINE only (thickness=2), no filled blob
+    - When in flight (held=False): small filled dot at center (radius=4)
+    """
+    cx, cy = int(cx), int(cy)
+    if held:
+        # When held: draw thin outline (not filled blob)
+        cv2.circle(frame, (cx, cy), radius, (0, 220, 0), 2, cv2.LINE_AA)
+    else:
+        # When in flight: draw small filled dot at center
+        cv2.circle(frame, (cx, cy), 4, (0, 220, 0), -1, cv2.LINE_AA)
+
+
+# ─────────────────────────────────────────────
+# 2. Past trajectory (red arc)
+# ─────────────────────────────────────────────
+def draw_trajectory_trail(frame, positions, max_points=30):
+    """
+    Draw the last N detected ball positions as a smooth red arc.
+    Uses moving-average smoothing (window=3) and cv2.polylines for clean rendering.
+    """
+    pts = list(positions)[-max_points:]
+    if len(pts) < 2:
+        return
+
+    # Apply moving-average smoothing to reduce jitter
+    pts_smooth = smooth_positions(pts, window=3)
+    pts_smooth = np.int32(pts_smooth)
+    
+    # Draw as smooth polyline with anti-aliasing
+    cv2.polylines(frame, [pts_smooth], False, (0, 0, 255), 2, cv2.LINE_AA)
+
+    # Bright red dot at the most recent position
+    cv2.circle(frame, pts[-1], 4, (0, 0, 255), -1, cv2.LINE_AA)
+
+
+# ─────────────────────────────────────────────
+# 3. Predicted future arc (blue)
+# ─────────────────────────────────────────────
+def draw_predicted_arc(frame, predicted_points, max_points=80):
+    """
+    Draw the EKF forward projection as a smooth blue polyline.
+    Add small filled circles every 5th point for clarity.
+    """
+    pts = predicted_points[:max_points]
+    if len(pts) < 2:
+        return
+
+    # Convert to int32 for polylines
+    pts_int = np.int32(pts)
+    
+    # Draw smooth blue polyline
+    cv2.polylines(frame, [pts_int], False, (255, 100, 0), 2, cv2.LINE_AA)
+
+    # Draw small filled circles every 5th point for visual markers
+    for i in range(0, len(pts), 5):
+        cv2.circle(frame, pts_int[i], 3, (255, 100, 0), -1, cv2.LINE_AA)
+
+    # Mark the end of the predicted arc
+    cv2.circle(frame, pts_int[-1], 5, (255, 180, 0), -1, cv2.LINE_AA)
+
+
+# Keep old name for backwards compat with trajectory.py
+def draw_predicted_trajectory(frame, predicted_points):
+    draw_predicted_arc(frame, predicted_points)
+
+
+# ─────────────────────────────────────────────
+# 4. Uncertainty ellipses (red, clamped to 80px)
+# ─────────────────────────────────────────────
+MAX_ELLIPSE_AXIS = 80   # pixels — hard cap so they stay readable
+
+def draw_uncertainty_ellipses(frame, ellipses, color=(0, 0, 200)):
+    """
+    Draw 66% confidence ellipses along the predicted arc.
+    Axes are clamped to MAX_ELLIPSE_AXIS to prevent giant blobs.
+    """
+    h, w = frame.shape[:2]
+    for ell in ellipses:
+        if ell is None:
+            continue
+        cx, cy = int(ell["center"][0]), int(ell["center"][1])
+        # Clamp axes
+        a = int(min(ell["axes"][0], MAX_ELLIPSE_AXIS))
+        b = int(min(ell["axes"][1], MAX_ELLIPSE_AXIS))
+        angle = float(ell["angle"])
+
+        if a < 2 or b < 2:
+            continue
+        if not (0 <= cx < w and 0 <= cy < h):
+            continue
+
+        try:
+            cv2.ellipse(frame, (cx, cy), (a, b), angle,
+                        0, 360, color, 1, cv2.LINE_AA)
+        except cv2.error:
+            pass
+
+
+# ─────────────────────────────────────────────
+# 5. EKF Telemetry panel (bottom-left)
+# ─────────────────────────────────────────────
+def draw_telemetry_panel(frame, ekf_state, Pr=0.0):
+    """
+    Bottom-left semi-transparent panel showing EKF state.
+
+    Args:
+        ekf_state: dict from EKFBallTracker.get_ekf_state()
+        Pr:        Monte Carlo shot probability float 0-1
+    """
+    if ekf_state is None:
+        return
+
+    px_m   = ekf_state.get("px_m",    0.0)
+    py_m   = ekf_state.get("py_m",    0.0)
+    vx_ms  = ekf_state.get("vx_ms",   0.0)
+    vy_ms  = ekf_state.get("vy_ms",   0.0)
+    speed  = ekf_state.get("speed_ms", 0.0)
+
+    lines = [
+        ("EKF Telemetry",              (255, 255, 255), 0.52, 2),
+        (f"Pos:   ({px_m:+.2f}, {py_m:+.2f}) m",  (160, 160, 255), 0.46, 1),
+        (f"Vel:   ({vx_ms:+.2f}, {vy_ms:+.2f}) m/s", (160, 160, 255), 0.46, 1),
+        (f"Speed: {speed:.2f} m/s",    (160, 160, 255), 0.46, 1),
+        (f"Pr = {Pr:.3f}",             (60, 80, 255),   0.50, 2),
+    ]
+
+    font   = cv2.FONT_HERSHEY_SIMPLEX
+    pad    = 10
+    line_h = 22
+    panel_w = 265
+    panel_h = len(lines) * line_h + 2 * pad
+
+    h_frame = frame.shape[0]
+    px0 = 10
+    py0 = h_frame - panel_h - 10
+
+    # Semi-transparent background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (px0, py0),
+                  (px0 + panel_w, py0 + panel_h), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+    # Red left-edge accent
+    cv2.line(frame, (px0, py0), (px0, py0 + panel_h), (0, 0, 200), 3)
+
+    for i, (text, color, scale, thick) in enumerate(lines):
+        y = py0 + pad + (i + 1) * line_h - 4
+        cv2.putText(frame, text, (px0 + pad, y),
+                    font, scale, color, thick, cv2.LINE_AA)
+
+
+# ─────────────────────────────────────────────
+# 6. Prediction panel (top-right)
+# ─────────────────────────────────────────────
+def draw_prediction_panel(frame, prediction, confidence):
+    """
+    Top-right panel: large SCORE/MISS label + confidence bar.
+
+    Args:
+        prediction:  "SCORE" | "MISS" | None
+        confidence:  float 0-1
+    """
+    if prediction is None:
+        return
+
+    h_frame, w_frame = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    is_score = (prediction == "SCORE")
+    label_color  = (0, 220, 60)   if is_score else (0, 50, 240)
+    bg_color     = (0, 60, 10)    if is_score else (20, 10, 60)
+    bar_color    = (0, 200, 60)   if is_score else (0, 50, 220)
+
+    panel_w = 230
+    panel_h = 85
+    px0 = w_frame - panel_w - 10
+    py0 = 10
+
+    # Background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (px0, py0),
+                  (px0 + panel_w, py0 + panel_h), bg_color, -1)
+    cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
+
+    # Label
+    cv2.putText(frame, prediction,
+                (px0 + 14, py0 + 48),
+                font, 1.5, label_color, 3, cv2.LINE_AA)
+
+    # Confidence text
+    conf_text = f"Confidence: {confidence:.0%}"
+    cv2.putText(frame, conf_text,
+                (px0 + 14, py0 + 68),
+                font, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # Confidence bar
+    bar_x = px0 + 14
+    bar_y = py0 + 73
+    bar_max_w = panel_w - 28
+    bar_h = 6
+    cv2.rectangle(frame, (bar_x, bar_y),
+                  (bar_x + bar_max_w, bar_y + bar_h), (60, 60, 60), -1)
+    fill_w = int(bar_max_w * confidence)
+    if fill_w > 0:
+        cv2.rectangle(frame, (bar_x, bar_y),
+                      (bar_x + fill_w, bar_y + bar_h), bar_color, -1)
+
+
+# Keep old name used by trajectory.py
+def draw_prediction_label(frame, prediction, confidence, frame_w):
+    draw_prediction_panel(frame, prediction, confidence)
+
+
+# ─────────────────────────────────────────────
+# 7. Hoop rectangle (green)
+# ─────────────────────────────────────────────
+def draw_hoop_region(frame, hoop_rect, is_score=False):
+    """
+    Draw the calibrated hoop rectangle.
+    Flashes brighter green on a SCORE prediction.
+    """
+    if hoop_rect is None:
+        return
+    x, y, w, h = hoop_rect
+    color = (0, 255, 80) if is_score else (0, 200, 0)
+    thickness = 3 if is_score else 2
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness, cv2.LINE_AA)
+
+    # Cross-hair at centre
+    cx, cy = x + w // 2, y + h // 2
+    cv2.drawMarker(frame, (cx, cy), color,
+                   cv2.MARKER_CROSS, 16, 1, cv2.LINE_AA)
+
+    # "HOOP" label
+    cv2.putText(frame, "HOOP", (x, y - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44, color, 1, cv2.LINE_AA)
+
+
+# ─────────────────────────────────────────────
+# 8. FPS counter (top-left)
+# ─────────────────────────────────────────────
+def draw_fps(frame, fps):
+    """Draw FPS in the top-left corner."""
+    cv2.putText(frame, f"FPS: {fps:.0f}",
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                0.65, (180, 180, 180), 1, cv2.LINE_AA)
+
+
+# ─────────────────────────────────────────────
+# Debug mask window
+# ─────────────────────────────────────────────
+def show_debug_mask(mask, window_name="ShotIQ — HSV Mask"):
+    """Show the HSV detection mask in a separate window."""
+    if mask is None:
+        return
+    display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    cv2.putText(display, "HSV Mask (D to hide)",
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.imshow(window_name, display)
+
+
+# ─────────────────────────────────────────────
+# Stubs kept for backwards compat
+# ─────────────────────────────────────────────
+def draw_ball_bbox(frame, x, y, w, h):
+    """Legacy — replaced by draw_ball_dot; kept so imports don't break."""
+    pass
+
+def draw_status_bar(frame, text, frame_h, frame_w):
+    """Legacy stub — status bar removed from clean UI."""
+    pass
+
+def draw_no_ball_indicator(frame, frames_missing):
+    """Show a small 'No Ball' notice when tracking is lost."""
+    if frames_missing < 5:
+        return
+    cv2.putText(frame, f"No ball ({frames_missing}f)",
+                (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (100, 100, 255), 1, cv2.LINE_AA)

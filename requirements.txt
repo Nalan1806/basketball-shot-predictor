@@ -3,3 +3,5 @@
 
 opencv-python>=4.8.0
 numpy>=1.24.0
+ultralytics>=8.0.0  # YOLOv8 object detection
+mediapipe>=0.10.0,<0.10.15  # 0.10.15+ dropped mp.solutions; pin to legacy API

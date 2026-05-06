@@ -1,134 +1,164 @@
 """
 Ball Tracking Module for the Basketball Shot Prediction System.
 
-Maintains a history of ball positions across frames, handles
-detection gaps, and provides smoothed position data for
-trajectory estimation.
+This module now wraps the Extended Kalman Filter tracker (EKFBallTracker)
+while preserving the exact public interface used by main.py and trajectory.py.
+
+All EKF physics / covariance / uncertainty logic lives in ekf_tracker.py.
+This module is the single import point for main.py.
+
+Public interface (unchanged from previous BallTracker):
+    update(detection, confidence)
+    get_positions()
+    get_smoothed_positions()
+    get_raw_positions()
+    get_frames_missing()
+    get_velocity()
+    get_speed()
+    has_enough_data()
+    get_predicted_position()
+    get_last_detection_position()
+    get_confidence()
+    is_using_prediction()
+    reset()
+
+New EKF-specific accessors (used by trajectory.py and main.py):
+    predict_trajectory(n_steps)        — EKF forward projection (pixels)
+    get_uncertainty_ellipse(step)      — 66% confidence ellipse at step
+    get_ekf_state()                    — dict for telemetry panel
 """
 
-from collections import deque
+from ekf_tracker import EKFBallTracker
+from pixel_to_world import PixelToWorld
 import config
-import utils
 
 
 class BallTracker:
     """
-    Tracks a single basketball across consecutive frames.
+    Drop-in replacement for the original Kalman-based BallTracker.
 
-    Responsibilities:
-      - Store position history in a fixed-size buffer
-      - Validate new detections (reject impossible jumps)
-      - Handle frames where the ball is not detected
-      - Provide smoothed trajectory data
-      - Track ball direction and velocity
+    Delegates all work to EKFBallTracker, which implements a 5-state
+    Extended Kalman Filter with aerodynamic drag physics.
     """
 
     def __init__(self):
-        # Position history: deque of (x, y) tuples
-        self.positions = deque(maxlen=config.MAX_TRACK_POINTS)
+        ptw = PixelToWorld()
+        self._ekf = EKFBallTracker(pixel_to_world=ptw)
 
-        # Raw (unsmoothed) positions for trajectory fitting
-        self.raw_positions = deque(maxlen=config.MAX_TRACK_POINTS)
-
-        # Consecutive frames without a detection
-        self.frames_missing = 0
-
-        # Current state
-        self.is_tracking = False
-        self.last_position = None
-        self.velocity = (0, 0)  # (dx, dy) per frame
-        self.direction = None   # "up", "down", "left", "right"
-
-    def update(self, detection):
+    # ------------------------------------------------------------------
+    # Core update — called once per frame by main.py
+    # ------------------------------------------------------------------
+    def update(self, detection, confidence=0.0):
         """
-        Update tracker with a new detection (or None if ball not found).
+        Update the EKF tracker with the latest ball detection.
 
         Args:
-            detection: dict from BallDetector.detect(), or None.
+            detection: dict from BallDetector, or None.
+            confidence: float 0–1 detection confidence.
 
         Returns:
-            True if the ball is being actively tracked, False otherwise.
+            True if ball is actively tracked, False otherwise.
         """
-        if detection is not None:
-            new_pos = (detection["cx"], detection["cy"])
+        return self._ekf.update(detection, confidence=confidence)
 
-            # Validate: reject if the ball "jumped" too far in one frame
-            if self.last_position is not None:
-                dist = utils.distance(self.last_position, new_pos)
-                if dist > config.MAX_DISTANCE_JUMP:
-                    # Suspicious jump — could be noise. Skip this frame.
-                    self.frames_missing += 1
-                    return self._check_tracking_status()
-
-            # Valid detection — update state
-            self.raw_positions.append(new_pos)
-            self.positions.append(new_pos)
-
-            # Calculate velocity
-            if self.last_position is not None:
-                dx = new_pos[0] - self.last_position[0]
-                dy = new_pos[1] - self.last_position[1]
-                self.velocity = (dx, dy)
-                self._update_direction(dx, dy)
-
-            self.last_position = new_pos
-            self.frames_missing = 0
-            self.is_tracking = True
-
-        else:
-            # No detection this frame
-            self.frames_missing += 1
-
-        return self._check_tracking_status()
-
-    def _check_tracking_status(self):
-        """Check if we should still consider ourselves as tracking."""
-        if self.frames_missing > config.MAX_FRAMES_MISSING:
-            # Ball has been missing too long — reset tracking
-            self.is_tracking = False
-        return self.is_tracking
-
-    def _update_direction(self, dx, dy):
-        """Determine the primary direction of ball movement."""
-        if abs(dx) > abs(dy):
-            self.direction = "right" if dx > 0 else "left"
-        else:
-            self.direction = "down" if dy > 0 else "up"
-
+    # ------------------------------------------------------------------
+    # Position accessors
+    # ------------------------------------------------------------------
     def get_positions(self):
-        """Return the list of tracked positions."""
-        return list(self.positions)
+        """Tracked positions in pixel space."""
+        return self._ekf.get_positions()
 
     def get_smoothed_positions(self):
-        """Return smoothed positions for cleaner trajectory visualization."""
-        return utils.smooth_positions(list(self.positions))
+        """Moving-average smoothed positions in pixel space."""
+        return self._ekf.get_smoothed_positions()
 
     def get_raw_positions(self):
-        """Return unsmoothed positions for polynomial fitting."""
-        return list(self.raw_positions)
+        """Unsmoothed raw detection positions in pixel space."""
+        return self._ekf.get_raw_positions()
 
+    # ------------------------------------------------------------------
+    # State accessors
+    # ------------------------------------------------------------------
     def get_frames_missing(self):
-        """Return how many consecutive frames the ball has been missing."""
-        return self.frames_missing
+        """Number of consecutive frames with no detection."""
+        return self._ekf.get_frames_missing()
 
     def get_velocity(self):
-        """Return the current velocity (dx, dy) in pixels/frame."""
-        return self.velocity
+        """Estimated velocity (dx, dy) in pixels/frame."""
+        return self._ekf.get_velocity()
 
     def get_speed(self):
-        """Return the scalar speed in pixels/frame."""
-        return utils.distance((0, 0), self.velocity)
+        """Scalar speed in pixels/frame."""
+        return self._ekf.get_speed()
 
     def has_enough_data(self):
-        """Check if we have enough data points for trajectory prediction."""
-        return len(self.positions) >= config.MIN_POINTS_FOR_PREDICTION
+        """True if enough data for trajectory prediction."""
+        return self._ekf.has_enough_data()
+
+    def get_predicted_position(self):
+        """EKF predicted pixel position (for debug overlay)."""
+        return self._ekf.get_predicted_position()
+
+    def get_last_detection_position(self):
+        """Last raw detection pixel position."""
+        return self._ekf.get_last_detection_position()
+
+    def get_confidence(self):
+        """Current detection confidence."""
+        return self._ekf.get_confidence()
+
+    def is_using_prediction(self):
+        """True if in predict-only mode (no recent detection)."""
+        return self._ekf.is_using_prediction()
+
+    # ------------------------------------------------------------------
+    # EKF-specific accessors (new, used by trajectory.py / main.py)
+    # ------------------------------------------------------------------
+    def predict_trajectory(self, n_steps=None):
+        """
+        Run EKF forward projection for n_steps steps.
+
+        Returns:
+            list of (px, py) pixel tuples.
+        """
+        return self._ekf.predict_trajectory(n_steps=n_steps)
+
+    def get_uncertainty_ellipse(self, step):
+        """
+        66% confidence ellipse parameters at a future step.
+
+        Returns:
+            dict {center, axes, angle} or None.
+        """
+        return self._ekf.get_uncertainty_ellipse(step)
+
+    def get_ekf_state(self):
+        """
+        Current EKF state for the telemetry overlay.
+
+        Returns:
+            dict {px_m, py_m, vx_ms, vy_ms, beta, speed_ms, P_pos}
+        """
+        return self._ekf.get_ekf_state()
+
+    def get_lost_frames(self):
+        """
+        Current lost_frames counter.
+
+        Returns:
+            int: 0 = real detection, 1-10 = coasting, >10 = reset
+        """
+        return self._ekf.get_lost_frames()
+
+    def covariance_healthy(self):
+        """
+        Check if EKF covariance is well-conditioned and actively tracking.
+
+        Returns:
+            bool: True if trace(P) <= 200 AND lost_frames == 0
+        """
+        return self._ekf.covariance_healthy()
 
     def reset(self):
-        """Clear all tracking data."""
-        self.positions.clear()
-        self.raw_positions.clear()
-        self.frames_missing = 0
-        self.is_tracking = False
-        self.last_position = None
-        self.velocity = (0, 0)
-        self.direction = None
+        """Reset all tracking state."""
+        self._ekf.reset()

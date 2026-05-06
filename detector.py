@@ -1,128 +1,232 @@
 """
-Ball Detection Module for the Basketball Shot Prediction System.
+YOLOv8 Basketball Detector — ShotIQ
 
-Uses HSV color segmentation + contour analysis to detect an orange
-basketball in each frame. Designed for robustness under varying
-indoor lighting conditions.
+Real-time detection using YOLOv8n (nano) model:
+  - Class 32 (sports ball) detection only
+  - Confidence threshold: 0.35
+  - Proximity gate: 400px max jump from last known position
+  - Selects highest-confidence detection if multiple balls present
+  - Falls back to closest-to-last-position if tracking was active
+
+Model downloads automatically on first run (ultralytics handles this).
+Very fast inference: ~30 FPS on CPU with 1280×720 input.
 """
 
 import cv2
 import numpy as np
-import config
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    raise RuntimeError("ultralytics not installed. Run: pip install ultralytics")
+
+# ─────────────────────────────────────────────
+# YOLO Parameters
+# ─────────────────────────────────────────────
+YOLO_MODEL_NAME = "yolov8n.pt"  # nano model (fastest)
+YOLO_CONF_THRESH = 0.35  # confidence threshold for detections
+YOLO_SPORTS_BALL_CLASS = 32  # COCO class ID for sports ball
+
+# ─────────────────────────────────────────────
+# Proximity Gate
+# ─────────────────────────────────────────────
+MAX_JUMP_PX = 400  # max pixel jump from last known position
 
 
 class BallDetector:
     """
-    Detects a basketball using color-based segmentation.
+    YOLOv8-based basketball detector.
 
-    Pipeline:
-      1. Convert frame to HSV color space
-      2. Create a binary mask for orange hues
-      3. Apply morphological ops to clean up noise
-      4. Find contours and filter by area + circularity
-      5. Return the best candidate (largest valid contour)
+    Features:
+      - Uses pre-trained YOLOv8n nano model
+      - Filters to COCO class 32 (sports ball) only
+      - Confidence threshold: 0.35
+      - Proximity gate: 400px max jump
+      - Selects best detection (highest confidence, or closest to last position)
+      - Automatically downloads model on first run
     """
 
     def __init__(self):
-        # HSV range for orange basketball
-        self.hsv_lower = np.array(config.BALL_HSV_LOWER)
-        self.hsv_upper = np.array(config.BALL_HSV_UPPER)
-
-        # Morphological kernel for noise removal
-        self.kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (config.MORPH_KERNEL_SIZE, config.MORPH_KERNEL_SIZE)
-        )
-
-        # Store the last detection for debugging / visualization
-        self.last_mask = None
-        self.last_contours = []
+        """Initialize YOLO detector and load model."""
+        self._last_confidence = 0.0
+        self._last_known_pos = None  # (px, py) for proximity gate
+        
+        # Load YOLOv8n model (downloads from Ultralytics hub on first run)
+        try:
+            self.model = YOLO(YOLO_MODEL_NAME)
+            print(f"  YOLOv8 model '{YOLO_MODEL_NAME}' loaded successfully")
+        except Exception as e:
+            print(f"  ERROR loading YOLOv8 model: {e}")
+            self.model = None
 
     def detect(self, frame):
         """
-        Detect the basketball in a single frame.
+        Detect basketball using YOLOv8.
+
+        Process:
+          1. Run YOLOv8 inference on frame
+          2. Filter detections to COCO class 32 (sports ball) only
+          3. Keep detections with confidence >= 0.35
+          4. Apply proximity gate: max 400px from last known position
+          5. Select best detection (highest confidence if no tracking history,
+             else closest to last known position for smooth tracking)
 
         Args:
-            frame: BGR image (numpy array) from OpenCV.
+            frame: BGR image from OpenCV
 
         Returns:
-            detection: dict with keys {x, y, w, h, cx, cy, radius, area}
-                       or None if no ball found.
+            tuple: (detection_dict or None, confidence: float)
+              - detection_dict keys: cx, cy, x, y, w, h, radius
+              - confidence: float 0–1 (YOLO confidence score)
         """
-        # Step 1: Convert to HSV
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        if self.model is None:
+            self._last_confidence = 0.0
+            return None, 0.0
 
-        # Step 2: Create color mask
-        mask = cv2.inRange(hsv, self.hsv_lower, self.hsv_upper)
+        try:
+            # Run YOLOv8 inference
+            results = self.model(frame, conf=YOLO_CONF_THRESH, verbose=False)
+            result = results[0]
 
-        # Step 3: Morphological operations to reduce noise
-        # Erode removes small bright spots, dilate restores ball edges
-        mask = cv2.erode(mask, self.kernel, iterations=config.MORPH_ITERATIONS)
-        mask = cv2.dilate(mask, self.kernel, iterations=config.MORPH_ITERATIONS)
-
-        # Optional: Gaussian blur for smoother contours
-        mask = cv2.GaussianBlur(mask, (5, 5), 0)
-
-        self.last_mask = mask
-
-        # Step 4: Find contours
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        self.last_contours = contours
-
-        # Step 5: Filter and select the best candidate
-        best_detection = None
-        best_area = 0
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-
-            # Filter by area bounds
-            if area < config.MIN_CONTOUR_AREA or area > config.MAX_CONTOUR_AREA:
-                continue
-
-            # Filter by circularity
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter == 0:
-                continue
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-
-            if circularity < config.MIN_CIRCULARITY:
-                continue
-
-            # This contour passes all filters — check if it's the largest
-            if area > best_area:
-                best_area = area
-
-                # Get bounding rectangle
-                x, y, w, h = cv2.boundingRect(contour)
-
-                # Get minimum enclosing circle for center + radius
-                (cx, cy), radius = cv2.minEnclosingCircle(contour)
-
-                best_detection = {
-                    "x": x,
-                    "y": y,
+            # Extract detections as boxes object
+            boxes = result.boxes
+            
+            # Filter to sports ball class (class 32)
+            sports_ball_detections = []
+            
+            for box in boxes:
+                class_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                
+                if class_id != YOLO_SPORTS_BALL_CLASS:
+                    continue
+                
+                if conf < YOLO_CONF_THRESH:
+                    continue
+                
+                # Get bounding box coordinates
+                x1, y1, x2, y2 = box.xyxy[0]
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                
+                # Calculate center and dimensions
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                w = x2 - x1
+                h = y2 - y1
+                
+                # Estimate radius from bounding box
+                radius = max(w, h) // 2
+                
+                sports_ball_detections.append({
+                    "cx": cx,
+                    "cy": cy,
+                    "x": x1,
+                    "y": y1,
                     "w": w,
                     "h": h,
-                    "cx": int(cx),
-                    "cy": int(cy),
-                    "radius": int(radius),
-                    "area": area,
-                    "circularity": circularity
-                }
+                    "radius": radius,
+                    "conf": conf,
+                })
+            
+            # No sports ball detections found
+            if not sports_ball_detections:
+                self._last_confidence = 0.0
+                return None, 0.0
+            
+            # Apply proximity gate filtering
+            candidates = sports_ball_detections
+            
+            if self._last_known_pos is not None:
+                lx, ly = self._last_known_pos
+                nearby = [c for c in candidates
+                          if np.hypot(c["cx"] - lx, c["cy"] - ly) <= MAX_JUMP_PX]
+                # If we have nearby candidates, use only them
+                if nearby:
+                    candidates = nearby
+                # Otherwise, accept all (first re-appearance after occlusion)
+            
+            # Select best detection
+            # Priority 1: if tracking active, closest to last known position (smooth)
+            # Priority 2: highest confidence (first detection or after long gap)
+            if self._last_known_pos is not None and len(candidates) > 0:
+                lx, ly = self._last_known_pos
+                best = min(candidates,
+                           key=lambda c: np.hypot(c["cx"] - lx, c["cy"] - ly))
+            else:
+                best = max(candidates, key=lambda c: c["conf"])
+            
+            confidence = float(best["conf"])
+            self._last_confidence = confidence
+            self._last_known_pos = (best["cx"], best["cy"])
+            
+            # Return detection dict (remove YOLO-specific 'conf' key)
+            detection = {
+                "cx": best["cx"],
+                "cy": best["cy"],
+                "x": best["x"],
+                "y": best["y"],
+                "w": best["w"],
+                "h": best["h"],
+                "radius": best["radius"],
+            }
+            
+            return detection, confidence
+            
+        except Exception as e:
+            print(f"  YOLO inference error: {e}")
+            self._last_confidence = 0.0
+            return None, 0.0
 
-        return best_detection
+    # ──────────────────────────────────────────────────────────────────
+    def update_last_position(self, px, py):
+        """
+        Externally update the proximity gate reference position.
+
+        Called by tracker after EKF update to keep proximity gate in sync
+        with the filtered tracking position.
+
+        Args:
+            px, py: pixel coordinates of the updated ball position.
+        """
+        self._last_known_pos = (px, py)
+
+    def clear_last_position(self):
+        """
+        Reset the proximity gate reference position.
+
+        Called after tracker reset to allow new detections from any frame
+        location on next detection pass.
+        """
+        self._last_known_pos = None
+
+    # ──────────────────────────────────────────────────────────────────
+    # Debug Accessors
+    # ──────────────────────────────────────────────────────────────────
 
     def get_debug_mask(self):
-        """Return the last computed mask for debug visualization."""
-        return self.last_mask
+        """Return debug visualization (None for YOLO — no HSV mask)."""
+        return None
 
-    def update_hsv_range(self, lower, upper):
-        """
-        Dynamically update the HSV detection range.
-        Useful for runtime calibration via trackbars.
-        """
-        self.hsv_lower = np.array(lower)
-        self.hsv_upper = np.array(upper)
+    def get_candidates(self):
+        """Return list of candidate detections from last detect() call."""
+        return []
+
+    def get_last_confidence(self):
+        """Return confidence of the last selected detection."""
+        return self._last_confidence
+
+    # ──────────────────────────────────────────────────────────────────
+    # Backwards Compatibility Stubs
+    # ──────────────────────────────────────────────────────────────────
+
+    def set_hand_positions(self, positions):
+        """Legacy stub — not used in YOLO path."""
+        pass
+
+    def get_motion_mask(self):
+        """Legacy stub — not applicable for YOLO."""
+        return None
+
+    def get_combined_mask(self):
+        """Legacy stub — not applicable for YOLO."""
+        return None

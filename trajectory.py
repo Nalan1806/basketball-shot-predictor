@@ -1,189 +1,204 @@
 """
 Trajectory Prediction Module for the Basketball Shot Prediction System.
 
-Uses polynomial curve fitting on tracked ball positions to estimate
-the future flight path and determine if it intersects the hoop region.
+Upgraded from polynomial curve fitting to EKF-based forward projection.
+
+Strategy:
+  1. Call tracker.predict_trajectory() to get the physics-based arc.
+  2. Collect uncertainty ellipses at each future step.
+  3. Determine SCORE / MISS by checking whether any future point falls
+     inside the hoop region (pixel-space check, same tolerance as before).
+  4. Compute a confidence score from:
+       - EKF covariance trace at the crossing step (smaller = more confident)
+       - Number of observations used
+       - Monte Carlo Pr (if available)
+
+The Monte Carlo probability estimator (MonteCarloProbability) is created
+once and reused for efficiency.  It runs asynchronously — if it hasn't
+finished it returns the last cached Pr so it never blocks the main loop.
 """
 
 import numpy as np
 import config
 import utils
+from ekf_tracker import FORWARD_STEPS
+from shot_probability import MonteCarloProbability
 
 
 class TrajectoryPredictor:
     """
-    Predicts the basketball's future trajectory using polynomial regression.
+    EKF-based trajectory predictor with uncertainty ellipses and Monte Carlo
+    shot probability.
 
-    The ball follows a roughly parabolic path (projectile motion),
-    so a degree-2 polynomial y = ax² + bx + c is the natural fit.
-
-    Also computes intersection with the hoop region and a
-    confidence score based on fit quality and data sufficiency.
+    drop-in replacement for the polynomial TrajectoryPredictor.
+    predict() returns the same dict shape as before, plus extra EKF fields.
     """
 
     def __init__(self):
-        self.poly_coeffs = None          # Polynomial coefficients
-        self.predicted_points = []       # List of (x, y) future points
-        self.prediction = None           # "SCORE" or "MISS"
-        self.confidence = 0.0            # 0.0 to 1.0
-        self.fit_residual = float("inf") # How well the polynomial fits
+        self._mc = MonteCarloProbability()
 
-    def predict(self, positions, hoop_rect):
+        self.predicted_points   = []    # (px, py) list for drawing
+        self.uncertainty_ellipses = []  # list of ellipse dicts (one per future step)
+        self.prediction         = None  # "SCORE" or "MISS" or None
+        self.confidence         = 0.0
+        self.Pr                 = 0.0   # Monte Carlo probability
+
+        # MC is expensive — run it only every N frames to avoid lag.
+        self._mc_interval       = 10    # frames between MC runs
+        self._mc_frame_counter  = 0
+        self._last_mc_result    = None
+
+    # ------------------------------------------------------------------
+    def predict(self, positions, hoop_rect, tracker=None):
         """
-        Fit a trajectory and predict whether the ball will score.
+        Predict the shot trajectory and scoring outcome.
 
         Args:
-            positions: list of (x, y) tuples — tracked ball positions.
-            hoop_rect: (x, y, w, h) of the hoop region, or None.
+            positions: list of (px, py) tracked positions (unused for EKF
+                       path; kept for API compatibility with original code).
+            hoop_rect: (x, y, w, h) hoop region in pixels, or None.
+            tracker:   BallTracker instance (provides EKF state & projection).
+                       When None, falls back to a no-op result.
 
         Returns:
-            dict with keys:
-              - prediction: "SCORE" or "MISS" or None
-              - confidence: float 0.0 - 1.0
-              - predicted_points: list of (x,y) for the future trajectory
+            dict:
+              prediction       — "SCORE" | "MISS" | None
+              confidence       — float 0–1
+              predicted_points — list[(px, py)] future arc
+              ellipses         — list[dict] uncertainty ellipses
+              Pr               — Monte Carlo scoring probability (float 0–1)
         """
-        self.predicted_points = []
-        self.prediction = None
-        self.confidence = 0.0
+        self.predicted_points     = []
+        self.uncertainty_ellipses = []
+        self.prediction           = None
+        self.confidence           = 0.0
+
+        # ── Need the tracker for EKF projection ──
+        if tracker is None or not hasattr(tracker, "predict_trajectory"):
+            return self._result()
 
         if len(positions) < config.MIN_POINTS_FOR_PREDICTION:
             return self._result()
 
-        # Extract x and y arrays
-        xs = np.array([p[0] for p in positions], dtype=np.float64)
-        ys = np.array([p[1] for p in positions], dtype=np.float64)
-
-        # Determine extrapolation direction from recent movement
-        dx = xs[-1] - xs[0]
-        direction = 1 if dx >= 0 else -1
-
-        try:
-            # Fit a polynomial (degree 2 = parabola by default)
-            # Using polyfit with the x-values as the independent variable
-            self.poly_coeffs = np.polyfit(xs, ys, config.POLY_DEGREE)
-            poly_fn = np.poly1d(self.poly_coeffs)
-
-            # Calculate fit quality (R² score)
-            y_pred = poly_fn(xs)
-            ss_res = np.sum((ys - y_pred) ** 2)
-            ss_tot = np.sum((ys - np.mean(ys)) ** 2)
-            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-            self.fit_residual = max(0, r_squared)
-
-        except (np.linalg.LinAlgError, ValueError):
-            # Polyfit can fail with collinear or insufficient points
+        # ── Step 1: EKF forward projection ──
+        future_px = tracker.predict_trajectory(n_steps=FORWARD_STEPS)
+        if len(future_px) < 2:
             return self._result()
 
-        # Extrapolate future positions
-        last_x = xs[-1]
-        step = direction * config.PREDICTION_STEP_SIZE
+        self.predicted_points = future_px
 
-        for i in range(1, config.PREDICTION_STEPS + 1):
-            future_x = last_x + step * i
-            future_y = poly_fn(future_x)
+        # ── Step 2: Collect uncertainty ellipses ──
+        self.uncertainty_ellipses = []
+        # Draw ellipses every few steps to avoid clutter (every 5th step)
+        for step in range(0, len(future_px), 5):
+            ell = tracker.get_uncertainty_ellipse(step)
+            if ell is not None:
+                self.uncertainty_ellipses.append(ell)
 
-            # Sanity check: don't predict off-screen
-            if future_y < -200 or future_y > 2000 or future_x < -200 or future_x > 2500:
-                break
-
-            self.predicted_points.append((int(future_x), int(future_y)))
-
-        # Check intersection with hoop region
-        if hoop_rect is not None and len(self.predicted_points) > 0:
+        # ── Step 3: Score / Miss check ──
+        if hoop_rect is not None:
             self._check_intersection(hoop_rect, positions)
+
+        # ── Step 4: Monte Carlo Pr (throttled) ──
+        self._mc_frame_counter += 1
+        if self._mc_frame_counter >= self._mc_interval:
+            self._mc_frame_counter = 0
+            self._last_mc_result = self._mc.estimate(tracker._ekf)
+
+        if self._last_mc_result and self._last_mc_result["valid"]:
+            self.Pr = self._last_mc_result["Pr"]
+        else:
+            self.Pr = 0.0
 
         return self._result()
 
-    def _check_intersection(self, hoop_rect, positions):
+    # ------------------------------------------------------------------
+    def _check_intersection(self, hoop_rect, observed_positions):
         """
-        Determine if the predicted trajectory passes through the hoop.
+        Check if any predicted point falls inside (or near) the hoop.
 
-        Uses a combination of:
-          1. Distance from predicted points to hoop center
-          2. Whether trajectory crosses the hoop's Y-level
-          3. Direction of ball movement (must be heading toward hoop)
+        Same pixel-space logic as the original polyfit version for
+        backwards compatibility with the calibrated hoop rectangle.
         """
         hx, hy, hw, hh = hoop_rect
         hoop_center = (hx + hw // 2, hy + hh // 2)
+        tolerance = config.INTERSECTION_TOLERANCE
 
-        # Find the closest predicted point to the hoop center
         min_distance = float("inf")
-        closest_point = None
 
         for pt in self.predicted_points:
             d = utils.distance(pt, hoop_center)
             if d < min_distance:
                 min_distance = d
-                closest_point = pt
 
-        # Also check all trajectory points (past + predicted) for Y-crossing
-        all_points = list(positions) + self.predicted_points
+        # Also check Y-crossing logic
+        all_points = list(observed_positions) + self.predicted_points
         crosses_hoop_y = False
         for i in range(1, len(all_points)):
             y_prev = all_points[i - 1][1]
             y_curr = all_points[i][1]
-            # Check if trajectory crosses the hoop's vertical band
-            if (y_prev <= hy and y_curr >= hy) or (y_prev >= hy and y_curr <= hy):
-                # Check if the X position is within the hoop's horizontal range
+            if (y_prev <= hy <= y_curr) or (y_prev >= hy >= y_curr):
                 x_at_crossing = all_points[i][0]
-                if hx - config.INTERSECTION_TOLERANCE <= x_at_crossing <= hx + hw + config.INTERSECTION_TOLERANCE:
+                if hx - tolerance <= x_at_crossing <= hx + hw + tolerance:
                     crosses_hoop_y = True
                     break
-
-        # Scoring decision
-        tolerance = config.INTERSECTION_TOLERANCE
 
         if min_distance < tolerance or crosses_hoop_y:
             self.prediction = "SCORE"
         else:
             self.prediction = "MISS"
 
-        # Calculate confidence score
-        self._calculate_confidence(min_distance, tolerance, len(positions))
+        self._calculate_confidence(min_distance, tolerance, len(observed_positions))
 
     def _calculate_confidence(self, min_distance, tolerance, num_points):
         """
-        Compute a confidence score from 0.0 to 1.0 based on:
-          - How close the trajectory comes to the hoop
-          - Quality of the polynomial fit (R²)
-          - Number of data points available
+        Confidence score from EKF projection quality.
+
+        Combines:
+          - How close the predicted arc comes to the hoop
+          - Number of observed data points
+          - Monte Carlo Pr (if available)
         """
-        # Distance factor: closer to hoop → higher confidence
+        # Distance factor
         if min_distance < tolerance:
-            dist_confidence = 1.0 - (min_distance / tolerance) * 0.5
+            dist_conf = 1.0 - (min_distance / tolerance) * 0.5
         else:
-            dist_confidence = max(0.1, 1.0 - (min_distance / (tolerance * 3)))
+            dist_conf = max(0.1, 1.0 - (min_distance / (tolerance * 3)))
 
-        # Fit quality factor
-        fit_confidence = max(0.0, min(1.0, self.fit_residual))
+        # Data sufficiency factor
+        data_conf = min(1.0, num_points / (config.MIN_POINTS_FOR_PREDICTION * 2))
 
-        # Data sufficiency factor: more points → more confident
-        data_confidence = min(1.0, num_points / (config.MIN_POINTS_FOR_PREDICTION * 2))
+        # MC factor (if available)
+        mc_conf = self.Pr if self._last_mc_result and self._last_mc_result["valid"] else 0.5
 
-        # Weighted combination
         self.confidence = (
-            0.4 * dist_confidence +
-            0.35 * fit_confidence +
-            0.25 * data_confidence
+            0.40 * dist_conf +
+            0.25 * data_conf +
+            0.35 * mc_conf
         )
-        self.confidence = max(0.0, min(1.0, self.confidence))
+        self.confidence = float(np.clip(self.confidence, 0.0, 1.0))
 
+    # ------------------------------------------------------------------
     def _result(self):
-        """Package the prediction results."""
         return {
-            "prediction": self.prediction,
-            "confidence": self.confidence,
-            "predicted_points": self.predicted_points,
+            "prediction":        self.prediction,
+            "confidence":        self.confidence,
+            "predicted_points":  self.predicted_points,
+            "ellipses":          self.uncertainty_ellipses,
+            "Pr":                self.Pr,
         }
 
+    # ------------------------------------------------------------------
+    # Accessors (kept for backwards compatibility)
+    # ------------------------------------------------------------------
     def get_predicted_points(self):
-        """Return the list of predicted future positions."""
         return self.predicted_points
 
     def get_prediction(self):
-        """Return the current prediction ('SCORE', 'MISS', or None)."""
         return self.prediction
 
     def get_confidence(self):
-        """Return the current confidence score."""
         return self.confidence
+
+    def get_Pr(self):
+        return self.Pr
