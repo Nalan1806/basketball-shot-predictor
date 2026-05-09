@@ -1,57 +1,54 @@
-"""Headless smoke test for EKF tracker and Monte Carlo module.
+"""Headless smoke test for simplified ShotIQ tracker and predictor.
 
-Uses pixel coordinates within the default calibrated camera region
-(640x700 = free-throw line, 640x240 = basket) so the homography
-produces sensible metre values.
+Tests the Kalman tracker and gravity-based trajectory predictor
+without requiring a camera or display.
 """
 import numpy as np
-from ekf_tracker import EKFBallTracker
-from shot_probability import MonteCarloProbability
+from tracker import BallTracker
+from trajectory import TrajectoryPredictor
 
-ekf = EKFBallTracker()
+tracker = BallTracker()
+predictor = TrajectoryPredictor()
 
 # Simulate 15 detections along a parabolic arc (pixel space).
-# Start near the calibrated free-throw region and arc upward toward basket.
-# Basket is ~(640, 240) in default camera, free-throw line is ~(640, 700).
+dt = 1.0 / 30.0
 for i in range(15):
     t = i / 30.0
-    # Move from x=580 to x=700, arc from y=650 up toward y=350
     px = 580 + i * 8
-    py = 650 - 200 * t + 100 * t * t   # parabola opening down (upward arc)
+    py = 650 - 200 * t + 100 * t * t
     det = {
         'cx': int(px), 'cy': int(py),
         'x': int(px) - 10, 'y': int(py) - 10, 'w': 20, 'h': 20,
-        'radius': 10, 'area': 314, 'circularity': 0.9,
+        'radius': 10,
     }
-    ekf.update(det, confidence=0.85)
+    tracker.update(det, confidence=0.85, dt=dt)
 
-state = ekf.get_ekf_state()
-print('EKF state:', {k: round(v, 3) for k, v in state.items() if k != 'P_pos'})
+# --- Test 1: tracker state ---
+state = tracker.get_state()
+print('Tracker state:', {k: round(v, 2) if isinstance(v, float) else v for k, v in state.items()})
+assert state["tracking"], "Should be tracking after 15 detections"
 
-# --- Test 1: forward trajectory ---
-future = ekf.predict_trajectory(n_steps=50)
-assert len(future) > 0, "Expected some future points"
-print(f'Future points: {len(future)} first={future[0]} last={future[-1]}')
+# --- Test 2: positions recorded ---
+positions = tracker.get_positions()
+assert len(positions) >= 10, f"Expected 10+ positions, got {len(positions)}"
+print(f"Tracked {len(positions)} positions")
 
-# --- Test 2: uncertainty ellipse ---
-ell = ekf.get_uncertainty_ellipse(min(10, len(future) - 1))
-print('Ellipse step 10:', ell)
+# --- Test 3: trajectory prediction ---
+hoop_rect = (680, 250, 120, 80)
+result = predictor.predict(positions, hoop_rect, dt=dt)
+print(f"Prediction: {result['prediction']}, Confidence: {result['confidence']:.3f}")
+print(f"Predicted points: {len(result['predicted_points'])}")
+assert len(result['predicted_points']) > 0, "Expected predicted points"
 
-# --- Test 3: Monte Carlo ---
-mc = MonteCarloProbability(n_simulations=100)
-res = mc.estimate(ekf)
-assert 0.0 <= res["Pr"] <= 1.0, f"Pr={res['Pr']} out of bounds"
-print('MC result:', {k: round(v, 4) if isinstance(v, float) else v for k, v in res.items()})
-
-# --- Test 4: State values are finite ---
-s = ekf.get_ekf_state()
-for key in ('px_m', 'py_m', 'vx_ms', 'vy_ms', 'beta', 'speed_ms'):
-    assert np.isfinite(s[key]), f"State value {key}={s[key]} is not finite"
+# --- Test 4: velocity is sensible ---
+speed = tracker.get_speed()
+print(f"Speed: {speed:.1f} px/s")
+assert speed > 0, "Speed should be positive after moving detections"
 
 # --- Test 5: reset works ---
-ekf.reset()
-assert not ekf.initialized
-assert len(ekf.get_positions()) == 0
-print('Reset OK')
+tracker.reset()
+assert not tracker.is_tracking
+assert len(tracker.get_positions()) == 0
+print("Reset OK")
 
-print('\nAll tests PASSED')
+print("\nAll tests PASSED")
