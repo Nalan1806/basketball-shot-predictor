@@ -99,12 +99,4 @@ ShotIQ/
 *   **📱 Mobile Integration:** Optimization for on-device analysis.
 *   **📊 Multi-Shot Stats:** Session-wide analytics reporting (Shot map, consistency scores).
 
----
 
-## 🤝 Contributing
-
-Contributions to improve detection accuracy or UI aesthetics are welcome. Feel free to open an issue or submit a pull request.
-
----
-
-*ShotIQ — Elevating the game through AI.*
